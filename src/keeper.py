@@ -90,17 +90,6 @@ class ChainWorker:
                 logger.exception("%s failed to prepare %s", self.chain["name"], pool.id)
         return prepared_intents
 
-    async def finish_pending(self):
-        mined = await self.transaction_lane.finish_active_batch()
-        for item in mined:
-            if item["status"] != 1:
-                logger.error(
-                    "%s %s reverted at nonce %d",
-                    self.chain["name"],
-                    item["label"],
-                    item["nonce"],
-                )
-
     async def heartbeat(self):
         latest_block = await self.transaction_lane.w3.eth.get_block("latest")
         refreshed_states = await self._refresh_last_upkeep_timestamps(latest_block["number"])
@@ -108,32 +97,20 @@ class ChainWorker:
             refreshed_states, latest_block["timestamp"]
         )
         prepared_intents = await self._prepare_intents(candidate_states)
-        await self.transaction_lane.start_batch(prepared_intents)
-        if self.transaction_lane.active_batch:
-            await self.finish_pending()
-        else:
+        submitted = await self.transaction_lane.start_batch(prepared_intents, track=False)
+        if not submitted:
             logger.info("%s idle", self.chain["name"])
-
-    async def run_cycle(self):
-        if self.transaction_lane.active_batch:
-            await self.finish_pending()
-        else:
-            await self.heartbeat()
 
     async def run_until_stopped(self, stop, once):
         if once:
-            await self.run_cycle()
+            await self.heartbeat()
             return
         while not stop.is_set():
             try:
-                await self.run_cycle()
+                await self.heartbeat()
             except Exception:
                 logger.exception("%s keeper cycle failed", self.chain["name"])
-            delay = (
-                self.app["pending_poll_seconds"]
-                if self.transaction_lane.active_batch
-                else self.app["heartbeat_seconds"]
-            )
+            delay = self.app["heartbeat_seconds"]
             try:
                 await asyncio.wait_for(stop.wait(), delay)
             except TimeoutError:

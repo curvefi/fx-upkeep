@@ -43,15 +43,15 @@ uv run src/prepare.py --dry-run
 uv run src/keeper.py --validate-only
 ```
 
-Only one process may use the keeper EOA at a time. While its nonce lane is idle, the keeper scans
-pools on the configured heartbeat. A batch reserves its observed token balances across pools, so
+Only one process may use the keeper EOA at a time because concurrent nonce allocation can collide.
+The keeper scans pools on the configured heartbeat. A batch reserves observed token balances, so
 two pools cannot independently spend the same inventory. For EIP-1559 blocks, transactions use
 twice the current base fee as the `maxFeePerGas` baseline and the greater of 5% of base fee, the
 node's suggested tip, or one wei as priority; `maxFeePerGas` is raised only when required to cover
 base plus that priority. At zero base fee, both fee fields use the greater of node gas price, node
-tip, or one wei. Every ten minutes, the keeper checks whether pending transactions were included;
-it never replaces or reprices them. Once the batch is included, it returns to the heartbeat.
-Transaction hashes and batches exist only in memory. A restart forgets them, reads the latest
-mined nonce, and does not inspect the pending nonce. Swap direction is selected from live balances:
-the configured side is preferred when fully funded, otherwise the reverse side is tried before a
-bounded partial swap. Ankr is the primary RPC; dRPC is an optional transport fallback.
+tip, or one wei. The keeper submits each batch and immediately returns to its heartbeat without
+checking receipts, replacing transactions, or repricing them. New batches use the pending nonce,
+so they queue after any still-pending transaction instead of replacing it. Swap direction is
+selected from live balances: the configured side is preferred when fully funded, otherwise the
+reverse side is tried before a bounded partial swap. Ankr is the primary RPC; dRPC is an optional
+transport fallback.

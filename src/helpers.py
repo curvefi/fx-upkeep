@@ -173,8 +173,8 @@ class TransactionLane:
         if await self.w3.eth.chain_id != self.chain["chain_id"]:
             raise TransactionError(f"{self.chain['name']} RPC chain mismatch")
 
-    async def start_batch(self, intents):
-        """Number an in-memory batch from the latest mined nonce, then broadcast it."""
+    async def start_batch(self, intents, *, track=True):
+        """Number and broadcast a batch, optionally retaining it for receipt handling."""
         if not intents:
             return
         async with self._lock:
@@ -186,9 +186,10 @@ class TransactionLane:
             if not estimated_intents:
                 return
 
+            nonce_block = "latest" if track else "pending"
             (max_fee, priority_fee), nonce, balance = await asyncio.gather(
                 self._quote_fees(),
-                self.w3.eth.get_transaction_count(self.address, "latest"),
+                self.w3.eth.get_transaction_count(self.address, nonce_block),
                 self.w3.eth.get_balance(self.address),
             )
             batch = [
@@ -221,6 +222,10 @@ class TransactionLane:
                 except Exception:
                     logger.exception("%s stopped at nonce %d", self.chain["name"], item["nonce"])
                     break
+            submitted = self.active_batch
+            if not track:
+                self.active_batch = []
+            return submitted
 
     async def finish_active_batch(self):
         """Wait for this process's active batch, checking inclusion at each pending interval."""
@@ -228,7 +233,7 @@ class TransactionLane:
         while self.active_batch:
             wait_item = next((item for item in reversed(self.active_batch) if item["hashes"]), None)
             if wait_item is not None:
-                timeout = self.app["pending_poll_seconds"]
+                timeout = self.app["preparation_receipt_poll_seconds"]
                 logger.info(
                     "%s waiting up to %ds for nonce=%d receipt",
                     self.chain["name"],
@@ -246,7 +251,7 @@ class TransactionLane:
                     pass
             else:
                 # A failed initial broadcast has no receipt to await; retain the same backoff.
-                await asyncio.sleep(self.app["pending_poll_seconds"])
+                await asyncio.sleep(self.app["preparation_receipt_poll_seconds"])
             mined.extend(await self.reconcile())
         mined.sort(key=lambda item: item["nonce"])
         return mined
