@@ -26,8 +26,10 @@ uv run src/prepare.py
 
 Preparation sums configured input requirements by token and acquires only those input tokens. It
 builds one sequential batch per chain from a single pending nonce — acquisitions first, then
-approvals — producing consecutive transactions without checking receipts. It approves both pool
-coins so reverse-side inventory can be swapped back after the first pool swap.
+approvals — without checking receipts. The configured `max_batch_size` bounds each run;
+preparation refuses the entire batch before submission when that limit would be exceeded. Split
+the pool configuration or deliberately raise the limit before retrying. Both pool coins are
+approved so reverse-side inventory can be swapped back after the first pool swap.
 
 Run the keeper:
 

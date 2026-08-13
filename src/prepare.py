@@ -48,6 +48,14 @@ def _approval_state(chain, pool_config, coin_index, token, state):
     return result
 
 
+def _bounded_batch(intents, maximum):
+    if len(intents) > maximum:
+        raise TransactionError(
+            f"preparation batch has {len(intents)} intents; configured limit is {maximum}"
+        )
+    return intents
+
+
 async def _request_oneinch_swap(
     client,
     throttle,
@@ -383,13 +391,14 @@ async def _prepare_chain(
         results = acquisition_results + results
 
         if queued and not dry_run:
+            batch = _bounded_batch(queued, chain["max_batch_size"])
             try:
-                submitted = await lane.submit([intent for intent, _ in queued])
+                submitted = await lane.submit([intent for intent, _ in batch])
             except Exception as exc:  # noqa: BLE001 - a failed batch marks every intent rejected
                 logger.error("%s batch submit failed: %s", chain["name"], exc)
                 submitted = []
             returned = {record["label"]: record for record in submitted}
-            for intent, result in queued:
+            for intent, result in batch:
                 record = returned.get(intent["label"])
                 if record is not None:
                     result["state"] = (
