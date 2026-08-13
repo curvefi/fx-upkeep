@@ -16,16 +16,16 @@ logger = logging.getLogger(__name__)
 class ChainWorker:
     def __init__(self, app, chain):
         self.app, self.chain = app, chain
-        self.transaction_lane = TransactionLane(app, chain, os.environ)
+        self.lane = TransactionLane(app, chain, os.environ)
         self.pools = []
 
     async def initialize(self):
-        await self.transaction_lane.initialize()
+        await self.lane.initialize()
         for pool_config in self.app["pools"]:
             if pool_config["chain_id"] != self.chain["chain_id"]:
                 continue
             try:
-                pool = Pool(pool_config, self.transaction_lane.w3, self.app["slippage_bps"])
+                pool = Pool(pool_config, self.lane.w3, self.app["slippage_bps"])
                 await pool.initialize()
                 self.pools.append(pool)
             except Exception:
@@ -39,9 +39,7 @@ class ChainWorker:
             if len(intents) >= self.chain["max_batch_size"]:
                 break
             try:
-                intent, token, balance = await pool.prepare_intent(
-                    self.transaction_lane.address, balances
-                )
+                intent, token, balance = await pool.prepare_intent(self.lane.address, balances)
                 intents.append(intent)
                 balances[token] = balance
             except SkipPool as exc:
@@ -51,7 +49,7 @@ class ChainWorker:
         return intents
 
     async def heartbeat(self):
-        block = await self.transaction_lane.w3.eth.get_block("latest")
+        block = await self.lane.w3.eth.get_block("latest")
         timestamps = await asyncio.gather(
             *(pool.fetch_last_upkeep_timestamp(block["number"]) for pool in self.pools),
             return_exceptions=True,
@@ -66,7 +64,7 @@ class ChainWorker:
                 due.append((timestamp, pool.id, pool))
         due.sort(key=lambda item: item[:2])
         intents = await self._prepare_intents(pool for _, _, pool in due)
-        submitted = await self.transaction_lane.submit(intents, nonce_block="latest")
+        submitted = await self.lane.submit(intents, nonce_block="latest")
         if not submitted:
             logger.info("%s idle", self.chain["name"])
 
@@ -101,7 +99,7 @@ async def run_keeper(path, once=False, validate=False):
         await asyncio.gather(*(worker.run_until_stopped(stop, once) for worker in workers))
     finally:
         await asyncio.gather(
-            *(worker.transaction_lane.w3.provider.disconnect() for worker in workers),
+            *(worker.lane.w3.provider.disconnect() for worker in workers),
             return_exceptions=True,
         )
 

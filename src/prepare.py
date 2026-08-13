@@ -5,7 +5,6 @@ import asyncio
 import json
 import logging
 import os
-from decimal import Decimal
 from pathlib import Path
 
 import httpx
@@ -13,7 +12,7 @@ import yaml
 from dotenv import load_dotenv
 from web3 import Web3
 
-from helpers import ERC20_ABI, TWOCRYPTO_POOL_ABI, TransactionError, TransactionLane
+from helpers import Pool, TransactionError, TransactionLane
 
 logger = logging.getLogger(__name__)
 MAX_UINT = 2**256 - 1
@@ -25,17 +24,15 @@ class _OneInchThrottle:
     def __init__(self, interval_seconds):
         self.interval_seconds = interval_seconds
         self.last_request_at = None
-        self.lock = asyncio.Lock()
 
     async def get(self, client, url, **kwargs):
-        async with self.lock:
-            loop = asyncio.get_running_loop()
-            if self.last_request_at is not None:
-                delay = self.last_request_at + self.interval_seconds - loop.time()
-                if delay > 0:
-                    await asyncio.sleep(delay)
-            self.last_request_at = loop.time()
-            return await client.get(url, **kwargs)
+        loop = asyncio.get_running_loop()
+        if self.last_request_at is not None:
+            delay = self.last_request_at + self.interval_seconds - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+        self.last_request_at = loop.time()
+        return await client.get(url, **kwargs)
 
 
 def _approval_state(chain, pool_config, coin_index, token, state):
@@ -49,42 +46,6 @@ def _approval_state(chain, pool_config, coin_index, token, state):
     if token is not None:
         result["token"] = token
     return result
-
-
-async def _derive_inventory_targets(app, chain, w3):
-    targets = {}
-    token_contracts = {}
-    decimals_by_token = {}
-    for pool_config in app["pools"]:
-        if pool_config["chain_id"] != chain["chain_id"]:
-            continue
-        try:
-            pool_contract = w3.eth.contract(address=pool_config["address"], abi=TWOCRYPTO_POOL_ABI)
-            target_coin_index = pool_config["target_coin_idx"]
-            target_token_address = Web3.to_checksum_address(
-                await pool_contract.functions.coins(target_coin_index).call()
-            )
-            if target_token_address not in token_contracts:
-                token_contracts[target_token_address] = w3.eth.contract(
-                    address=target_token_address, abi=ERC20_ABI
-                )
-            target_token = token_contracts[target_token_address]
-            if target_token_address not in decimals_by_token:
-                decimals_by_token[
-                    target_token_address
-                ] = await target_token.functions.decimals().call()
-            target_input_amount = (
-                Decimal(str(pool_config["target_coin_amt"]))
-                * 10 ** decimals_by_token[target_token_address]
-            )
-            if target_input_amount != target_input_amount.to_integral_value():
-                raise ValueError("target amount exceeds token precision")
-            targets[target_token_address] = targets.get(target_token_address, 0) + int(
-                target_input_amount
-            )
-        except Exception as exc:  # noqa: BLE001 - isolate one configured pool
-            logger.error("cannot inspect %s: %s", pool_config["id"], exc)
-    return targets, token_contracts
 
 
 async def _request_oneinch_swap(
@@ -133,22 +94,6 @@ def _oneinch_uint(value, field):
     return parsed
 
 
-def _validate_oneinch_envelope(response, destination_token, minimum_output=1):
-    try:
-        source = Web3.to_checksum_address(response["srcToken"]["address"])
-        destination = Web3.to_checksum_address(response["dstToken"]["address"])
-        output = _oneinch_uint(response["dstAmount"], "dstAmount")
-    except (KeyError, TypeError, ValueError):
-        raise TransactionError("invalid 1inch token envelope") from None
-    if (
-        source != Web3.to_checksum_address(ONEINCH_NATIVE_TOKEN)
-        or destination != Web3.to_checksum_address(destination_token)
-        or output < minimum_output
-    ):
-        raise TransactionError("unexpected 1inch token envelope")
-    return output
-
-
 def _validate_oneinch_swap(
     response,
     *,
@@ -156,24 +101,29 @@ def _validate_oneinch_swap(
     destination_token,
     input_amount,
 ):
-    output = _validate_oneinch_envelope(response, destination_token)
     try:
+        source = Web3.to_checksum_address(response["srcToken"]["address"])
+        destination = Web3.to_checksum_address(response["dstToken"]["address"])
+        output = _oneinch_uint(response["dstAmount"], "dstAmount")
         transaction = response["tx"]
         sender = Web3.to_checksum_address(transaction["from"])
         router = Web3.to_checksum_address(transaction["to"])
         value = _oneinch_uint(transaction["value"], "transaction value")
         data = transaction["data"]
     except (KeyError, TypeError, ValueError):
-        raise TransactionError("invalid 1inch transaction envelope") from None
+        raise TransactionError("invalid 1inch swap envelope") from None
     if (
-        sender != Web3.to_checksum_address(owner_address)
+        source != Web3.to_checksum_address(ONEINCH_NATIVE_TOKEN)
+        or destination != Web3.to_checksum_address(destination_token)
+        or output < 1
+        or sender != Web3.to_checksum_address(owner_address)
         or router != ONEINCH_ROUTER
         or value != input_amount
         or not isinstance(data, str)
         or not data.startswith("0x")
         or len(data) < 10
     ):
-        raise TransactionError("unexpected 1inch transaction envelope")
+        raise TransactionError("unexpected 1inch swap envelope")
     try:
         bytes.fromhex(data[2:])
     except ValueError:
@@ -182,19 +132,20 @@ def _validate_oneinch_swap(
 
 
 async def _collect_acquisitions(
+    targets,
+    token_contracts,
     app,
     chain,
-    transaction_lane,
-    oneinch_api_key,
+    lane,
+    api_key,
     client,
     throttle,
     dry_run,
 ):
     queued = []
     results = []
-    w3 = transaction_lane.w3
-    owner_address = transaction_lane.address
-    targets, token_contracts = await _derive_inventory_targets(app, chain, w3)
+    w3 = lane.w3
+    owner_address = lane.address
     available_native = await w3.eth.get_balance(owner_address)
     logger.info("%s checking %d configured input tokens", chain["name"], len(targets))
     for token_address, target_amount in targets.items():
@@ -224,7 +175,7 @@ async def _collect_acquisitions(
             swap = await _request_oneinch_swap(
                 client,
                 throttle,
-                api_key=oneinch_api_key,
+                api_key=api_key,
                 chain_id=chain["chain_id"],
                 owner_address=owner_address,
                 destination_token=token_address,
@@ -258,7 +209,7 @@ async def _collect_acquisitions(
                 swap = await _request_oneinch_swap(
                     client,
                     throttle,
-                    api_key=oneinch_api_key,
+                    api_key=api_key,
                     chain_id=chain["chain_id"],
                     owner_address=owner_address,
                     destination_token=token_address,
@@ -313,45 +264,21 @@ async def _collect_acquisitions(
     return queued, results
 
 
-async def _inspect_chain(app, chain, transaction_lane):
-    results = []
+async def _inspect_pools(app, chain, lane):
+    targets = {}
+    target_tokens = {}
     approvals = []
-    queued_approvals = set()
-
+    results = []
+    seen_approvals = set()
     for pool_config in app["pools"]:
         if pool_config["chain_id"] != chain["chain_id"]:
             continue
         try:
-            pool_address = Web3.to_checksum_address(pool_config["address"])
-            pool_contract = transaction_lane.w3.eth.contract(
-                address=pool_address, abi=TWOCRYPTO_POOL_ABI
-            )
-            coin_addresses = tuple(
-                map(
-                    Web3.to_checksum_address,
-                    await asyncio.gather(
-                        pool_contract.functions.coins(0).call(),
-                        pool_contract.functions.coins(1).call(),
-                    ),
-                )
-            )
-            token_contracts = tuple(
-                transaction_lane.w3.eth.contract(address=address, abi=ERC20_ABI)
-                for address in coin_addresses
-            )
-            target_coin_index = pool_config["target_coin_idx"]
-            target_amount = (
-                Decimal(str(pool_config["target_coin_amt"]))
-                * 10 ** await token_contracts[target_coin_index].functions.decimals().call()
-            )
-            if target_amount != target_amount.to_integral_value():
-                raise ValueError("target amount exceeds token precision")
-            target_amount = int(target_amount)
-            paired_amount = await pool_contract.functions.get_dy(
-                target_coin_index, 1 - target_coin_index, target_amount
-            ).call()
-            required_allowances = [paired_amount, paired_amount]
-            required_allowances[target_coin_index] = target_amount
+            pool = Pool(pool_config, lane.w3, app["slippage_bps"])
+            await pool.initialize()
+            target = pool.coin_addresses[pool.target_coin_index]
+            targets[target] = targets.get(target, 0) + pool.input_amounts[pool.target_coin_index]
+            target_tokens.setdefault(target, pool.token_contracts[pool.target_coin_index])
         except Exception as exc:  # noqa: BLE001 - isolate one configured pool
             result = _approval_state(chain, pool_config, None, None, "inspection_failed")
             result["error"] = type(exc).__name__
@@ -359,11 +286,11 @@ async def _inspect_chain(app, chain, transaction_lane):
             continue
 
         for coin_index, (token_address, token_contract, required_allowance) in enumerate(
-            zip(coin_addresses, token_contracts, required_allowances, strict=True)
+            zip(pool.coin_addresses, pool.token_contracts, pool.input_amounts, strict=True)
         ):
             try:
                 allowance = await token_contract.functions.allowance(
-                    transaction_lane.address, pool_address
+                    lane.address, pool.address
                 ).call()
                 if allowance >= required_allowance:
                     logger.info(
@@ -383,8 +310,8 @@ async def _inspect_chain(app, chain, transaction_lane):
                     )
                     continue
 
-                approval_key = (chain["chain_id"], token_address, pool_address)
-                if approval_key in queued_approvals:
+                approval_key = (token_address, pool.address)
+                if approval_key in seen_approvals:
                     results.append(
                         _approval_state(
                             chain,
@@ -395,7 +322,7 @@ async def _inspect_chain(app, chain, transaction_lane):
                         )
                     )
                     continue
-                queued_approvals.add(approval_key)
+                seen_approvals.add(approval_key)
 
                 result = _approval_state(
                     chain, pool_config, coin_index, token_address, "approval_pending"
@@ -409,12 +336,10 @@ async def _inspect_chain(app, chain, transaction_lane):
                 approvals.append(
                     (
                         {
-                            "label": (
-                                f"approve:{chain['chain_id']}:{token_address}:{pool_address}"
-                            ),
+                            "label": f"approve:{chain['chain_id']}:{token_address}:{pool.address}",
                             "to": token_address,
                             "data": token_contract.encode_abi(
-                                "approve", args=[pool_address, MAX_UINT]
+                                "approve", args=[pool.address, MAX_UINT]
                             ),
                         },
                         result,
@@ -427,43 +352,39 @@ async def _inspect_chain(app, chain, transaction_lane):
                 result["error"] = type(exc).__name__
                 results.append(result)
 
-    return approvals, results
+    return targets, target_tokens, approvals, results
 
 
 async def _prepare_chain(
     app,
     chain,
-    oneinch_api_key,
+    api_key,
     client,
     throttle,
     dry_run,
 ):
-    transaction_lane = None
+    lane = None
     try:
-        transaction_lane = TransactionLane(app, chain, os.environ)
-        await transaction_lane.initialize()
-        results = []
-        queued = []
-
+        lane = TransactionLane(app, chain, os.environ)
+        await lane.initialize()
+        targets, target_tokens, approval_queued, results = await _inspect_pools(app, chain, lane)
         acquisition_queued, acquisition_results = await _collect_acquisitions(
+            targets,
+            target_tokens,
             app,
             chain,
-            transaction_lane,
-            oneinch_api_key=oneinch_api_key,
-            client=client,
-            throttle=throttle,
-            dry_run=dry_run,
+            lane,
+            api_key,
+            client,
+            throttle,
+            dry_run,
         )
-        queued.extend(acquisition_queued)
-        results.extend(acquisition_results)
-
-        approval_queued, approval_results = await _inspect_chain(app, chain, transaction_lane)
-        queued.extend(approval_queued)
-        results.extend(approval_results)
+        queued = acquisition_queued + approval_queued
+        results = acquisition_results + results
 
         if queued and not dry_run:
             try:
-                submitted = await transaction_lane.submit([intent for intent, _ in queued])
+                submitted = await lane.submit([intent for intent, _ in queued])
             except Exception as exc:  # noqa: BLE001 - a failed batch marks every intent rejected
                 logger.error("%s batch submit failed: %s", chain["name"], exc)
                 submitted = []
@@ -491,9 +412,9 @@ async def _prepare_chain(
             }
         ]
     finally:
-        if transaction_lane is not None:
+        if lane is not None:
             try:
-                await transaction_lane.w3.provider.disconnect()
+                await lane.w3.provider.disconnect()
             except Exception as exc:  # noqa: BLE001 - cleanup must not hide prior results
                 logger.error("%s RPC disconnect failed (%s)", chain["name"], type(exc).__name__)
 
@@ -501,8 +422,8 @@ async def _prepare_chain(
 async def run_preparation(path="config.yaml", dry_run=False):
     load_dotenv()
     app = yaml.safe_load(Path(path).read_text())
-    oneinch_api_key = os.environ.get("ONEINCH_API_KEY", "").strip()
-    if not oneinch_api_key:
+    api_key = os.environ.get("ONEINCH_API_KEY", "").strip()
+    if not api_key:
         raise RuntimeError("ONEINCH_API_KEY is required")
     throttle = _OneInchThrottle(app["acquisition_api_interval_seconds"])
     results = []
@@ -513,7 +434,7 @@ async def run_preparation(path="config.yaml", dry_run=False):
                 await _prepare_chain(
                     app,
                     chain,
-                    oneinch_api_key=oneinch_api_key,
+                    api_key=api_key,
                     client=client,
                     throttle=throttle,
                     dry_run=dry_run,
