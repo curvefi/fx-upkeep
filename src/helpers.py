@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import statistics
 from decimal import Decimal
 
 from eth_account import Account
@@ -224,7 +223,7 @@ class TransactionLane:
                     break
 
     async def finish_active_batch(self):
-        """Wait up to one pending interval for inclusion, then reconsider fees."""
+        """Wait for this process's active batch, checking inclusion at each pending interval."""
         mined = await self.reconcile()
         while self.active_batch:
             wait_item = next((item for item in reversed(self.active_batch) if item["hashes"]), None)
@@ -248,7 +247,7 @@ class TransactionLane:
             else:
                 # A failed initial broadcast has no receipt to await; retain the same backoff.
                 await asyncio.sleep(self.app["pending_poll_seconds"])
-            mined.extend(await self.reconcile(replace_pending=True))
+            mined.extend(await self.reconcile())
         mined.sort(key=lambda item: item["nonce"])
         return mined
 
@@ -276,14 +275,12 @@ class TransactionLane:
             raise NoIntentSurvived(f"{self.chain['name']} no intent survived gas estimation")
         return await self.finish_active_batch()
 
-    async def reconcile(self, *, replace_pending=False):
+    async def reconcile(self):
         """Check receipts for this process's transaction hashes."""
         async with self._lock:
             mined, unresolved = await self._reconcile_receipts(self.active_batch)
             mined.sort(key=lambda item: item["nonce"])
             self.active_batch = unresolved
-            if replace_pending and unresolved:
-                await self._replace_pending()
             return mined
 
     async def _estimate_intent(self, intent):
@@ -326,68 +323,20 @@ class TransactionLane:
             )
         return mined, pending
 
-    async def _replace_pending(self):
-        try:
-            quoted_max_fee, quoted_priority_fee = await self._quote_fees()
-        except TransactionError:
-            logger.error("%s replacement fee cap reached", self.chain["name"])
-            return
-        for item in self.active_batch:
-            while True:
-                bump = self.app["replacement_fee_bps"]
-                new_priority_fee = max(quoted_priority_fee, (item["tip"] * bump + 9_999) // 10_000)
-                new_max_fee = max(quoted_max_fee, (item["max_fee"] * bump + 9_999) // 10_000)
-                priority_fee_cap = int(self.chain["max_priority_fee_gwei"] * GWEI)
-                total_fee_cap = int(
-                    (self.chain["max_base_fee_gwei"] + self.chain["max_priority_fee_gwei"]) * GWEI
-                )
-                if new_priority_fee > priority_fee_cap or new_max_fee > total_fee_cap:
-                    logger.error("%s nonce %d reached fee cap", self.chain["name"], item["nonce"])
-                    return
-                # Only EIP-1559 fee fields may change across replacement versions.
-                item["tip"], item["max_fee"] = new_priority_fee, new_max_fee
-                try:
-                    await self._broadcast_version(item)
-                    logger.warning("%s replaced nonce %d", self.chain["name"], item["nonce"])
-                    break
-                except Exception as exc:
-                    message = str(exc).lower()
-                    if "nonce too low" in message:
-                        break
-                    if "replacement transaction underpriced" not in message:
-                        logger.exception("%s replacement failed", self.chain["name"])
-                        return
-                    quoted_priority_fee = new_priority_fee
-                    quoted_max_fee = new_max_fee
-
     async def _quote_fees(self):
-        block, history = await asyncio.gather(
+        block, node_tip = await asyncio.gather(
             self.w3.eth.get_block("latest"),
-            self.w3.eth.fee_history(20, "latest", [10.0]),
-            return_exceptions=True,
+            self.w3.eth.max_priority_fee,
         )
-        if isinstance(block, Exception):
-            raise block
-        if isinstance(history, Exception):
-            rewards = []
-            base_fee = block["baseFeePerGas"]
-        else:
-            rewards = [row[0] for row in history["reward"]]
-            # feeHistory's final base fee projects the block after its newest block.
-            base_fee = history["baseFeePerGas"][-1]
-        base_fee_cap = int(self.chain["max_base_fee_gwei"] * GWEI)
-        priority_fee_cap = int(self.chain["max_priority_fee_gwei"] * GWEI)
-        if base_fee > base_fee_cap:
+        base_fee = block.get("baseFeePerGas") or 0
+        if base_fee > self.chain["max_base_fee_gwei"] * GWEI:
             raise TransactionError(f"{self.chain['name']} base fee cap reached")
-        priority_fee = min(
-            priority_fee_cap,
-            max(
-                int(self.chain["min_priority_fee_gwei"] * GWEI),
-                int(statistics.median(rewards)) if rewards else 0,
-            ),
-        )
-        max_fee = min(2 * base_fee + priority_fee, base_fee_cap + priority_fee_cap)
-        return max_fee, priority_fee
+        if base_fee:
+            priority_fee = max(5 * base_fee // 100, node_tip, 1)
+            return max(2 * base_fee, base_fee + priority_fee), priority_fee
+        gas_price = await self.w3.eth.gas_price
+        priority_fee = max(gas_price, node_tip, 1)
+        return priority_fee, priority_fee
 
     async def _broadcast_version(self, item):
         signed = self.account.sign_transaction(

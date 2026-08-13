@@ -45,9 +45,12 @@ uv run src/keeper.py --validate-only
 
 Only one process may use the keeper EOA at a time. While its nonce lane is idle, the keeper scans
 pools on the configured heartbeat. A batch reserves its observed token balances across pools, so
-two pools cannot independently spend the same inventory. After submission the keeper waits up to
-one minute for inclusion, then replaces each unresolved call at the same nonce with higher fees,
-subject to the configured cap. Once the batch is included, it returns to the heartbeat.
+two pools cannot independently spend the same inventory. For EIP-1559 blocks, transactions use
+twice the current base fee as the `maxFeePerGas` baseline and the greater of 5% of base fee, the
+node's suggested tip, or one wei as priority; `maxFeePerGas` is raised only when required to cover
+base plus that priority. At zero base fee, both fee fields use the greater of node gas price, node
+tip, or one wei. Every ten minutes, the keeper checks whether pending transactions were included;
+it never replaces or reprices them. Once the batch is included, it returns to the heartbeat.
 Transaction hashes and batches exist only in memory. A restart forgets them, reads the latest
 mined nonce, and does not inspect the pending nonce. Swap direction is selected from live balances:
 the configured side is preferred when fully funded, otherwise the reverse side is tried before a
