@@ -60,8 +60,13 @@ class ChainWorker:
                 logger.error(
                     "%s failed to read %s timestamp: %s", self.chain["name"], pool.id, timestamp
                 )
-            elif block["timestamp"] >= timestamp + pool.upkeep_interval_seconds:
-                due.append((timestamp, pool.id, pool))
+            else:
+                gap = block["timestamp"] - timestamp
+                logger.info(
+                    "%s %s: last_ts=%d gap=%ds", self.chain["name"], pool.id, timestamp, gap
+                )
+                if gap >= pool.upkeep_interval_seconds:
+                    due.append((timestamp, pool.id, pool))
         due.sort(key=lambda item: item[:2])
         intents = await self._prepare_intents(pool for _, _, pool in due)
         submitted = await self.lane.submit(intents, nonce_block="latest")
