@@ -1,0 +1,28 @@
+heartbeat_seconds: 600 # Scan pools every 10 minutes while the nonce lane is idle
+pending_poll_seconds: 60 # Check inclusion and reconsider pending fees every minute
+slippage_bps: 100 # Pool and 1inch minimum-output tolerance; 100 is 1%
+gas_limit_bps: 12000 # Add 20% to eth_estimateGas; unused gas is not charged
+replacement_fee_bps: 11500 # Same-intent replacement bump; 15% clears common mempool rules
+gas_reserve_wei: 1000000000000000 # Native gas balance never spent on token acquisition
+acquisition_max_balance_bps: 1000 # At most 10% of native balance per token purchase
+acquisition_buffer_bps: 10200 # Buy the token deficit plus 2%
+acquisition_api_interval_seconds: 1 # Minimum delay between authenticated 1inch requests
+http_timeout_seconds: 20 # 1inch request timeout
+
+chains:
+  - name: ethereum
+    chain_id: 1
+    ankr_slug: eth # Ankr endpoint path; ANKR_API_KEY is required
+    drpc_slug: ethereum # dRPC endpoint path; DRPC_API_KEY enables fallback
+    max_batch_size: 8 # Bound sequential nonces and maximum batch gas exposure
+    max_base_fee_gwei: 1.49 # With the 1 gwei tip cap, 200k gas stays below $1 at $2k/ETH
+    min_priority_fee_gwei: 0.001 # 1 mwei floor; recent fee-history P10 may select more
+    max_priority_fee_gwei: 1 # Never pay more than a 1 gwei inclusion tip
+
+pools:
+  - id: yb-wbtc
+    chain_id: 1
+    address: "0x313698667d7FDD6789a9BC70821309ff891E729A"
+    frequency_seconds: 3600
+    target_coin_idx: 0
+    target_coin_amt: 0.05
