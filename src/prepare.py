@@ -11,7 +11,6 @@ from pathlib import Path
 import httpx
 import yaml
 from dotenv import load_dotenv
-from eth_account import Account
 from web3 import Web3
 
 from helpers import ERC20_ABI, TWOCRYPTO_POOL_ABI, TransactionError, TransactionLane
@@ -186,26 +185,20 @@ async def _collect_acquisitions(
     app,
     chain,
     transaction_lane,
-    *,
-    owner_address,
     oneinch_api_key,
     client,
     throttle,
     dry_run,
 ):
-    """Build acquisition intents and their result records without submitting."""
     queued = []
     results = []
     w3 = transaction_lane.w3
+    owner_address = transaction_lane.address
     targets, token_contracts = await _derive_inventory_targets(app, chain, w3)
     available_native = await w3.eth.get_balance(owner_address)
     logger.info("%s checking %d configured input tokens", chain["name"], len(targets))
     for token_address, target_amount in targets.items():
         try:
-            if token_address not in token_contracts:
-                token_contracts[token_address] = w3.eth.contract(
-                    address=token_address, abi=ERC20_ABI
-                )
             token_contract = token_contracts[token_address]
             token_balance = await token_contract.functions.balanceOf(owner_address).call()
             if token_balance >= target_amount:
@@ -272,7 +265,7 @@ async def _collect_acquisitions(
                     amount=input_amount,
                     slippage_bps=app["slippage_bps"],
                 )
-                transaction, quoted_output = _validate_oneinch_swap(
+                transaction, _ = _validate_oneinch_swap(
                     swap,
                     owner_address=owner_address,
                     destination_token=token_address,
@@ -305,7 +298,6 @@ async def _collect_acquisitions(
                 logger.info("%s acquiring %s: simulation passed", chain["name"], token_address)
                 results.append(result)
             else:
-                result["state"] = "acquisition_pending"
                 queued.append((intent, result))
                 available_native -= input_amount
         except Exception as exc:  # noqa: BLE001 - isolate one token acquisition
@@ -441,8 +433,6 @@ async def _inspect_chain(app, chain, transaction_lane):
 async def _prepare_chain(
     app,
     chain,
-    *,
-    owner_address,
     oneinch_api_key,
     client,
     throttle,
@@ -459,7 +449,6 @@ async def _prepare_chain(
             app,
             chain,
             transaction_lane,
-            owner_address=owner_address,
             oneinch_api_key=oneinch_api_key,
             client=client,
             throttle=throttle,
@@ -513,10 +502,8 @@ async def run_preparation(path="config.yaml", dry_run=False):
     load_dotenv()
     app = yaml.safe_load(Path(path).read_text())
     oneinch_api_key = os.environ.get("ONEINCH_API_KEY", "").strip()
-    private_key = os.environ.get("KEEPER_EOA_PK", "").strip()
-    if not oneinch_api_key or not private_key:
-        raise RuntimeError("ONEINCH_API_KEY and KEEPER_EOA_PK are required")
-    owner_address = Account.from_key(private_key).address
+    if not oneinch_api_key:
+        raise RuntimeError("ONEINCH_API_KEY is required")
     throttle = _OneInchThrottle(app["acquisition_api_interval_seconds"])
     results = []
 
@@ -526,7 +513,6 @@ async def run_preparation(path="config.yaml", dry_run=False):
                 await _prepare_chain(
                     app,
                     chain,
-                    owner_address=owner_address,
                     oneinch_api_key=oneinch_api_key,
                     client=client,
                     throttle=throttle,

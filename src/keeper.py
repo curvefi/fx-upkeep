@@ -3,7 +3,6 @@ import asyncio
 import logging
 import os
 import signal
-from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -14,21 +13,11 @@ from helpers import Pool, SkipPool, TransactionLane
 logger = logging.getLogger(__name__)
 
 
-def load_config(path):
-    return yaml.safe_load(Path(path).read_text())
-
-
-@dataclass
-class PoolState:
-    pool: Pool
-    last_upkeep_timestamp: int = 0
-
-
 class ChainWorker:
     def __init__(self, app, chain):
         self.app, self.chain = app, chain
         self.transaction_lane = TransactionLane(app, chain, os.environ)
-        self.pool_states = []
+        self.pools = []
 
     async def initialize(self):
         await self.transaction_lane.initialize()
@@ -38,66 +27,46 @@ class ChainWorker:
             try:
                 pool = Pool(pool_config, self.transaction_lane.w3, self.app["slippage_bps"])
                 await pool.initialize()
-                self.pool_states.append(PoolState(pool))
+                self.pools.append(pool)
             except Exception:
                 logger.exception("%s skipped %s", self.chain["name"], pool_config["id"])
-        logger.info("%s validated %d pools", self.chain["name"], len(self.pool_states))
+        logger.info("%s validated %d pools", self.chain["name"], len(self.pools))
 
-    async def _refresh_last_upkeep_timestamps(self, block_number):
-        timestamps = await asyncio.gather(
-            *(state.pool.fetch_last_upkeep_timestamp(block_number) for state in self.pool_states),
-            return_exceptions=True,
-        )
-        refreshed_states = []
-        for state, timestamp in zip(self.pool_states, timestamps, strict=True):
-            if isinstance(timestamp, Exception):
-                logger.error(
-                    "%s failed to read %s timestamp: %s",
-                    self.chain["name"],
-                    state.pool.id,
-                    timestamp,
-                )
-                continue
-            state.last_upkeep_timestamp = timestamp
-            refreshed_states.append(state)
-        return refreshed_states
-
-    def _select_candidate_states(self, refreshed_states, block_timestamp):
-        candidate_states = [
-            state
-            for state in refreshed_states
-            if block_timestamp >= state.last_upkeep_timestamp + state.pool.upkeep_interval_seconds
-        ]
-        candidate_states.sort(key=lambda state: (state.last_upkeep_timestamp, state.pool.id))
-        return candidate_states
-
-    async def _prepare_intents(self, candidate_states):
-        prepared_intents = []
-        balance_limits = {}
-        for state in candidate_states:
-            if len(prepared_intents) >= self.chain["max_batch_size"]:
+    async def _prepare_intents(self, pools):
+        intents = []
+        balances = {}
+        for pool in pools:
+            if len(intents) >= self.chain["max_batch_size"]:
                 break
-            pool = state.pool
             try:
-                intent, input_token, remaining_balance = await pool.prepare_intent(
-                    self.transaction_lane.address, balance_limits
+                intent, token, balance = await pool.prepare_intent(
+                    self.transaction_lane.address, balances
                 )
-                prepared_intents.append(intent)
-                balance_limits[input_token] = remaining_balance
+                intents.append(intent)
+                balances[token] = balance
             except SkipPool as exc:
                 logger.info("%s %s: %s", self.chain["name"], pool.id, exc)
             except Exception:
                 logger.exception("%s failed to prepare %s", self.chain["name"], pool.id)
-        return prepared_intents
+        return intents
 
     async def heartbeat(self):
-        latest_block = await self.transaction_lane.w3.eth.get_block("latest")
-        refreshed_states = await self._refresh_last_upkeep_timestamps(latest_block["number"])
-        candidate_states = self._select_candidate_states(
-            refreshed_states, latest_block["timestamp"]
+        block = await self.transaction_lane.w3.eth.get_block("latest")
+        timestamps = await asyncio.gather(
+            *(pool.fetch_last_upkeep_timestamp(block["number"]) for pool in self.pools),
+            return_exceptions=True,
         )
-        prepared_intents = await self._prepare_intents(candidate_states)
-        submitted = await self.transaction_lane.submit(prepared_intents, nonce_block="latest")
+        due = []
+        for pool, timestamp in zip(self.pools, timestamps, strict=True):
+            if isinstance(timestamp, Exception):
+                logger.error(
+                    "%s failed to read %s timestamp: %s", self.chain["name"], pool.id, timestamp
+                )
+            elif block["timestamp"] >= timestamp + pool.upkeep_interval_seconds:
+                due.append((timestamp, pool.id, pool))
+        due.sort(key=lambda item: item[:2])
+        intents = await self._prepare_intents(pool for _, _, pool in due)
+        submitted = await self.transaction_lane.submit(intents, nonce_block="latest")
         if not submitted:
             logger.info("%s idle", self.chain["name"])
 
@@ -110,16 +79,15 @@ class ChainWorker:
                 await self.heartbeat()
             except Exception:
                 logger.exception("%s keeper cycle failed", self.chain["name"])
-            delay = self.app["heartbeat_seconds"]
             try:
-                await asyncio.wait_for(stop.wait(), delay)
+                await asyncio.wait_for(stop.wait(), self.app["heartbeat_seconds"])
             except TimeoutError:
                 pass
 
 
 async def run_keeper(path, once=False, validate=False):
     load_dotenv()
-    app = load_config(path)
+    app = yaml.safe_load(Path(path).read_text())
     workers = [ChainWorker(app, chain) for chain in app["chains"]]
     try:
         await asyncio.gather(*(worker.initialize() for worker in workers))
