@@ -1,10 +1,8 @@
 # FX Upkeep
 
 Backend for FX pools: EOA token acquisition and approvals, plus a minimal multi-chain,
-multi-pool keeper runner.
-
-The goal is to advance lazy EMAs into current dynamic state, keeping pool quotes fresh and
-avoiding stale prices.
+multi-pool keeper runner that advances lazy EMAs toward current dynamic state so pool quotes
+stay fresh.
 
 ## Setup
 
@@ -20,15 +18,16 @@ upkeep frequency in `config.yaml`.
 
 ## Run
 
-Prepare token inventory and pool allowances manually:
+Prepare keeper inventory and pool allowances:
 
 ```bash
 uv run src/prepare.py
 ```
 
-Preparation sums configured input requirements by token and acquires only those input tokens.
-The first pool swap creates reverse-side inventory; both pool coins are approved so that inventory
-can be swapped back.
+Preparation sums configured input requirements by token and acquires only those input tokens. It
+builds one sequential batch per chain from a single pending nonce — acquisitions first, then
+approvals — producing consecutive transactions without checking receipts. It approves both pool
+coins so reverse-side inventory can be swapped back after the first pool swap.
 
 Run the keeper:
 
@@ -44,14 +43,14 @@ uv run src/keeper.py --validate-only
 ```
 
 Only one process may use the keeper EOA at a time because concurrent nonce allocation can collide.
-The keeper scans pools on the configured heartbeat. A batch reserves observed token balances, so
-two pools cannot independently spend the same inventory. For EIP-1559 blocks, transactions use
-twice the current base fee as the `maxFeePerGas` baseline and the greater of 5% of base fee, the
-node's suggested tip, or one wei as priority; `maxFeePerGas` is raised only when required to cover
-base plus that priority. At zero base fee, both fee fields use the greater of node gas price, node
-tip, or one wei. The keeper submits each batch and immediately returns to its heartbeat without
-checking receipts, replacing transactions, or repricing them. New batches use the pending nonce,
-so they queue after any still-pending transaction instead of replacing it. Swap direction is
-selected from live balances: the configured side is preferred when fully funded, otherwise the
-reverse side is tried before a bounded partial swap. Ankr is the primary RPC; dRPC is an optional
-transport fallback.
+Each heartbeat reads the latest mined nonce and quotes fees fresh, then submits due pool swaps in
+one batch; if a transaction is still pending at that nonce, the new transaction attempts to
+replace it. A batch reserves observed token balances so two pools cannot independently spend the
+same inventory. Swap direction is chosen from live balances: the configured side when fully
+funded, otherwise the reverse side, before a bounded partial swap.
+
+Transactions are stateless — no hashes or receipts are retained. For EIP-1559 blocks,
+`maxFeePerGas` starts at twice the base fee (raised only as needed to cover base plus priority),
+with priority the greater of 5% of the base fee, the node's suggested tip, or one wei; at a zero
+base fee both fee fields use the greater of node gas price, node tip, or one wei. Ankr is the
+primary RPC; dRPC is an optional transport fallback.

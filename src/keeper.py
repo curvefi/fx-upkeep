@@ -97,7 +97,7 @@ class ChainWorker:
             refreshed_states, latest_block["timestamp"]
         )
         prepared_intents = await self._prepare_intents(candidate_states)
-        submitted = await self.transaction_lane.start_batch(prepared_intents, track=False)
+        submitted = await self.transaction_lane.submit(prepared_intents, nonce_block="latest")
         if not submitted:
             logger.info("%s idle", self.chain["name"])
 

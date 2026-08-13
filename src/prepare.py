@@ -14,13 +14,7 @@ from dotenv import load_dotenv
 from eth_account import Account
 from web3 import Web3
 
-from helpers import (
-    ERC20_ABI,
-    TWOCRYPTO_POOL_ABI,
-    NoIntentSurvived,
-    TransactionError,
-    TransactionLane,
-)
+from helpers import ERC20_ABI, TWOCRYPTO_POOL_ABI, TransactionError, TransactionLane
 
 logger = logging.getLogger(__name__)
 MAX_UINT = 2**256 - 1
@@ -188,9 +182,10 @@ def _validate_oneinch_swap(
     return transaction, output
 
 
-async def _acquire_chain(
+async def _collect_acquisitions(
     app,
     chain,
+    transaction_lane,
     *,
     owner_address,
     oneinch_api_key,
@@ -198,44 +193,75 @@ async def _acquire_chain(
     throttle,
     dry_run,
 ):
+    """Build acquisition intents and their result records without submitting."""
+    queued = []
     results = []
-    transaction_lane = None
-    try:
-        transaction_lane = TransactionLane(app, chain, os.environ)
-        await transaction_lane.initialize()
-        w3 = transaction_lane.w3
-        targets, token_contracts = await _derive_inventory_targets(app, chain, w3)
-        logger.info("%s checking %d configured input tokens", chain["name"], len(targets))
-        for token_address, target_amount in targets.items():
-            try:
-                if token_address not in token_contracts:
-                    token_contracts[token_address] = w3.eth.contract(
-                        address=token_address, abi=ERC20_ABI
-                    )
-                token_contract = token_contracts[token_address]
-                token_balance, native_balance = await asyncio.gather(
-                    token_contract.functions.balanceOf(owner_address).call(),
-                    w3.eth.get_balance(owner_address),
+    w3 = transaction_lane.w3
+    targets, token_contracts = await _derive_inventory_targets(app, chain, w3)
+    available_native = await w3.eth.get_balance(owner_address)
+    logger.info("%s checking %d configured input tokens", chain["name"], len(targets))
+    for token_address, target_amount in targets.items():
+        try:
+            if token_address not in token_contracts:
+                token_contracts[token_address] = w3.eth.contract(
+                    address=token_address, abi=ERC20_ABI
                 )
-                if token_balance >= target_amount:
-                    logger.info("%s input token %s: already funded", chain["name"], token_address)
-                    results.append(
-                        {
-                            "chain": chain["name"],
-                            "token": token_address,
-                            "state": "funded",
-                        }
-                    )
-                    continue
-
-                maximum_input = min(
-                    native_balance * app["acquisition_max_balance_bps"] // 10_000,
-                    native_balance - app["gas_reserve_wei"],
+            token_contract = token_contracts[token_address]
+            token_balance = await token_contract.functions.balanceOf(owner_address).call()
+            if token_balance >= target_amount:
+                logger.info("%s input token %s: already funded", chain["name"], token_address)
+                results.append(
+                    {
+                        "phase": "acquisition",
+                        "chain": chain["name"],
+                        "token": token_address,
+                        "state": "funded",
+                    }
                 )
-                if maximum_input <= 0:
-                    raise TransactionError("gas reserve reached")
+                continue
 
-                logger.info("%s acquiring %s: sizing 1inch quote", chain["name"], token_address)
+            maximum_input = min(
+                available_native * app["acquisition_max_balance_bps"] // 10_000,
+                available_native - app["gas_reserve_wei"],
+            )
+            if maximum_input <= 0:
+                raise TransactionError("gas reserve reached")
+
+            logger.info("%s acquiring %s: sizing 1inch quote", chain["name"], token_address)
+            swap = await _request_oneinch_swap(
+                client,
+                throttle,
+                api_key=oneinch_api_key,
+                chain_id=chain["chain_id"],
+                owner_address=owner_address,
+                destination_token=token_address,
+                amount=maximum_input,
+                slippage_bps=app["slippage_bps"],
+            )
+            transaction, quoted_output = _validate_oneinch_swap(
+                swap,
+                owner_address=owner_address,
+                destination_token=token_address,
+                input_amount=maximum_input,
+            )
+            input_amount = min(
+                maximum_input,
+                max(
+                    1,
+                    maximum_input
+                    * (target_amount - token_balance)
+                    * app["acquisition_buffer_bps"]
+                    // quoted_output
+                    // 10_000,
+                ),
+            )
+            if input_amount < maximum_input:
+                logger.info(
+                    "%s acquiring %s: quoting exact input=%d wei",
+                    chain["name"],
+                    token_address,
+                    input_amount,
+                )
                 swap = await _request_oneinch_swap(
                     client,
                     throttle,
@@ -243,129 +269,56 @@ async def _acquire_chain(
                     chain_id=chain["chain_id"],
                     owner_address=owner_address,
                     destination_token=token_address,
-                    amount=maximum_input,
+                    amount=input_amount,
                     slippage_bps=app["slippage_bps"],
                 )
                 transaction, quoted_output = _validate_oneinch_swap(
                     swap,
                     owner_address=owner_address,
                     destination_token=token_address,
-                    input_amount=maximum_input,
+                    input_amount=input_amount,
                 )
-                input_amount = min(
-                    maximum_input,
-                    max(
-                        1,
-                        maximum_input
-                        * (target_amount - token_balance)
-                        * app["acquisition_buffer_bps"]
-                        // quoted_output
-                        // 10_000,
-                    ),
-                )
-                if input_amount < maximum_input:
-                    logger.info(
-                        "%s acquiring %s: quoting exact input=%d wei",
-                        chain["name"],
-                        token_address,
-                        input_amount,
-                    )
-                    swap = await _request_oneinch_swap(
-                        client,
-                        throttle,
-                        api_key=oneinch_api_key,
-                        chain_id=chain["chain_id"],
-                        owner_address=owner_address,
-                        destination_token=token_address,
-                        amount=input_amount,
-                        slippage_bps=app["slippage_bps"],
-                    )
-                    transaction, quoted_output = _validate_oneinch_swap(
-                        swap,
-                        owner_address=owner_address,
-                        destination_token=token_address,
-                        input_amount=input_amount,
-                    )
 
-                # 1inch owns route calldata semantics; exposed fields stay independently checked.
-                intent = {
-                    "label": f"acquire:{token_address}",
-                    "to": ONEINCH_ROUTER,
-                    "data": transaction["data"],
-                    "value": input_amount,
+            # 1inch owns route calldata semantics; exposed fields stay independently checked.
+            intent = {
+                "label": f"acquire:{token_address}",
+                "to": ONEINCH_ROUTER,
+                "data": transaction["data"],
+                "value": input_amount,
+            }
+            result = {
+                "phase": "acquisition",
+                "chain": chain["name"],
+                "token": token_address,
+                "eth_in": input_amount,
+            }
+            if dry_run:
+                await w3.eth.call(
+                    {
+                        "from": owner_address,
+                        "to": intent["to"],
+                        "data": intent["data"],
+                        "value": input_amount,
+                    }
+                )
+                result["state"] = "dry_run"
+                logger.info("%s acquiring %s: simulation passed", chain["name"], token_address)
+                results.append(result)
+            else:
+                result["state"] = "acquisition_pending"
+                queued.append((intent, result))
+                available_native -= input_amount
+        except Exception as exc:  # noqa: BLE001 - isolate one token acquisition
+            logger.error("%s acquisition failed: %s", token_address, exc)
+            results.append(
+                {
+                    "phase": "acquisition",
+                    "chain": chain["name"],
+                    "token": token_address,
+                    "state": "failed",
                 }
-                if dry_run:
-                    await w3.eth.call(
-                        {
-                            "from": owner_address,
-                            "to": intent["to"],
-                            "data": intent["data"],
-                            "value": input_amount,
-                        }
-                    )
-                    state = "dry_run"
-                    logger.info("%s acquiring %s: simulation passed", chain["name"], token_address)
-                else:
-                    logger.info("%s acquiring %s: submitting swap", chain["name"], token_address)
-                    mined_items = await transaction_lane.submit_and_wait([intent])
-                    if mined_items[0]["status"] != 1:
-                        raise TransactionError(f"{intent['label']} reverted")
-                    state = "acquired"
-                    logger.info("%s acquiring %s: included", chain["name"], token_address)
-                results.append(
-                    {
-                        "chain": chain["name"],
-                        "token": token_address,
-                        "state": state,
-                        "eth_in": input_amount,
-                    }
-                )
-            except Exception as exc:  # noqa: BLE001 - isolate one token acquisition
-                logger.error("%s acquisition failed: %s", token_address, exc)
-                results.append(
-                    {
-                        "chain": chain["name"],
-                        "token": token_address,
-                        "state": "failed",
-                    }
-                )
-    except Exception as exc:  # noqa: BLE001 - isolate one chain
-        logger.error("%s acquisition chain failed: %s", chain["name"], exc)
-        results.append({"chain": chain["name"], "state": "chain_failed"})
-    finally:
-        if transaction_lane is not None:
-            try:
-                await transaction_lane.w3.provider.disconnect()
-            except Exception as exc:  # noqa: BLE001 - cleanup must not hide prior results
-                logger.error("%s provider disconnect failed: %s", chain["name"], exc)
-    return results
-
-
-async def run_acquisition(path="config.yaml", dry_run=False):
-    load_dotenv()
-    app = yaml.safe_load(Path(path).read_text())
-    oneinch_api_key = os.environ.get("ONEINCH_API_KEY", "").strip()
-    private_key = os.environ.get("KEEPER_EOA_PK", "").strip()
-    if not oneinch_api_key or not private_key:
-        raise RuntimeError("ONEINCH_API_KEY and KEEPER_EOA_PK are required")
-    owner_address = Account.from_key(private_key).address
-    throttle = _OneInchThrottle(app["acquisition_api_interval_seconds"])
-    results = []
-
-    async with httpx.AsyncClient(timeout=app["http_timeout_seconds"]) as client:
-        for chain in app["chains"]:
-            results.extend(
-                await _acquire_chain(
-                    app,
-                    chain,
-                    owner_address=owner_address,
-                    oneinch_api_key=oneinch_api_key,
-                    client=client,
-                    throttle=throttle,
-                    dry_run=dry_run,
-                )
             )
-    return results
+    return queued, results
 
 
 async def _inspect_chain(app, chain, transaction_lane):
@@ -455,7 +408,6 @@ async def _inspect_chain(app, chain, transaction_lane):
                 result = _approval_state(
                     chain, pool_config, coin_index, token_address, "approval_pending"
                 )
-                results.append(result)
                 logger.info(
                     "%s %s coin%d: approval required",
                     chain["name"],
@@ -486,64 +438,60 @@ async def _inspect_chain(app, chain, transaction_lane):
     return approvals, results
 
 
-async def _submit_approvals(chain, transaction_lane, approvals, results):
-    max_batch_size = int(chain["max_batch_size"])
-    if max_batch_size <= 0:
-        raise ValueError("max_batch_size must be positive")
-
-    for offset in range(0, len(approvals), max_batch_size):
-        chunk = approvals[offset : offset + max_batch_size]
-        logger.info("%s submitting %d approvals", chain["name"], len(chunk))
-        try:
-            mined = await transaction_lane.submit_and_wait([intent for intent, _ in chunk])
-        except NoIntentSurvived as exc:
-            for _, result in chunk:
-                result["state"] = "approval_rejected"
-                result["error"] = type(exc).__name__
-            continue
-        except Exception as exc:  # noqa: BLE001 - independent chains must continue
-            for _, result in chunk:
-                result["state"] = "approval_failed"
-                result["error"] = type(exc).__name__
-            if transaction_lane.active_batch:
-                for _, result in approvals[offset + max_batch_size :]:
-                    result["state"] = "approval_blocked"
-                break
-            continue
-
-        result_by_label = {intent["label"]: result for intent, result in chunk}
-        for record in mined:
-            result = result_by_label.get(record.get("label"))
-            if result is None:
-                logger.error("%s returned an unknown approval receipt", chain["name"])
-                continue
-            result["state"] = "approved" if record.get("status") == 1 else "approval_reverted"
-            if "tx_hash" in record:
-                result["tx_hash"] = record["tx_hash"]
-            logger.info(
-                "%s %s coin%d: %s",
-                chain["name"],
-                result["pool"],
-                result["coin_index"],
-                result["state"],
-            )
-
-        for _, result in chunk:
-            if result["state"] == "approval_pending":
-                result["state"] = "approval_rejected"
-
-    return results
-
-
-async def _prepare_chain(app, chain, dry_run=False):
+async def _prepare_chain(
+    app,
+    chain,
+    *,
+    owner_address,
+    oneinch_api_key,
+    client,
+    throttle,
+    dry_run,
+):
     transaction_lane = None
     try:
         transaction_lane = TransactionLane(app, chain, os.environ)
         await transaction_lane.initialize()
-        approvals, results = await _inspect_chain(app, chain, transaction_lane)
-        if dry_run:
-            return results
-        return await _submit_approvals(chain, transaction_lane, approvals, results)
+        results = []
+        queued = []
+
+        acquisition_queued, acquisition_results = await _collect_acquisitions(
+            app,
+            chain,
+            transaction_lane,
+            owner_address=owner_address,
+            oneinch_api_key=oneinch_api_key,
+            client=client,
+            throttle=throttle,
+            dry_run=dry_run,
+        )
+        queued.extend(acquisition_queued)
+        results.extend(acquisition_results)
+
+        approval_queued, approval_results = await _inspect_chain(app, chain, transaction_lane)
+        queued.extend(approval_queued)
+        results.extend(approval_results)
+
+        if queued and not dry_run:
+            try:
+                submitted = await transaction_lane.submit([intent for intent, _ in queued])
+            except Exception as exc:  # noqa: BLE001 - a failed batch marks every intent rejected
+                logger.error("%s batch submit failed: %s", chain["name"], exc)
+                submitted = []
+            returned = {record["label"]: record for record in submitted}
+            for intent, result in queued:
+                record = returned.get(intent["label"])
+                if record is not None:
+                    result["state"] = (
+                        "submitted" if result["phase"] == "acquisition" else "approval_submitted"
+                    )
+                    result["tx_hash"] = record["tx_hash"]
+                else:
+                    result["state"] = (
+                        "failed" if result["phase"] == "acquisition" else "approval_rejected"
+                    )
+        results.extend(result for _, result in queued)
+        return results
     except Exception as exc:  # noqa: BLE001 - independent chains must continue
         return [
             {
@@ -564,23 +512,27 @@ async def _prepare_chain(app, chain, dry_run=False):
 async def run_preparation(path="config.yaml", dry_run=False):
     load_dotenv()
     app = yaml.safe_load(Path(path).read_text())
+    oneinch_api_key = os.environ.get("ONEINCH_API_KEY", "").strip()
+    private_key = os.environ.get("KEEPER_EOA_PK", "").strip()
+    if not oneinch_api_key or not private_key:
+        raise RuntimeError("ONEINCH_API_KEY and KEEPER_EOA_PK are required")
+    owner_address = Account.from_key(private_key).address
+    throttle = _OneInchThrottle(app["acquisition_api_interval_seconds"])
+    results = []
 
-    acquisition_results = await run_acquisition(path, dry_run=dry_run)
-    logger.info("acquisition complete; checking pool allowances")
-    results = [{**result, "phase": "acquisition"} for result in acquisition_results]
-    failed_acquisition_chains = {
-        result["chain"] for result in acquisition_results if result["state"] == "chain_failed"
-    }
-    chain_results = await asyncio.gather(
-        *(
-            _prepare_chain(app, chain, dry_run=dry_run)
-            for chain in app["chains"]
-            if chain["name"] not in failed_acquisition_chains
-        )
-    )
-
-    for prepared_chain in chain_results:
-        results.extend(prepared_chain)
+    async with httpx.AsyncClient(timeout=app["http_timeout_seconds"]) as client:
+        for chain in app["chains"]:
+            results.extend(
+                await _prepare_chain(
+                    app,
+                    chain,
+                    owner_address=owner_address,
+                    oneinch_api_key=oneinch_api_key,
+                    client=client,
+                    throttle=throttle,
+                    dry_run=dry_run,
+                )
+            )
     return results
 
 

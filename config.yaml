@@ -1,5 +1,4 @@
 heartbeat_seconds: 600 # Scan pools and submit due upkeep every 10 minutes
-preparation_receipt_poll_seconds: 60 # Manual prepare command only; keeper never checks receipts
 slippage_bps: 100 # Pool and 1inch minimum-output tolerance; 100 is 1%
 gas_limit_bps: 12000 # Add 20% to eth_estimateGas; unused gas is not charged
 gas_reserve_wei: 1000000000000000 # Native gas balance never spent on token acquisition
